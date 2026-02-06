@@ -2,11 +2,13 @@
 import argparse
 import sys
 import socket
+import concurrent.futures
 from datetime import datetime
 
 # --- Configuration ---
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 TOOL_NAME = "Cyber Sleuth Toolkit"
+MAX_THREADS = 50  # Number of simultaneous threads
 
 def banner():
     print(f"""
@@ -16,48 +18,48 @@ def banner():
     ===========================================
     """)
 
-def get_service_banner(ip, port):
-    """Attempts to grab a service banner from an open port."""
+def check_port(target_ip, port):
+    """Worker function: Checks a single port."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect((ip, port))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex((target_ip, port))
         
-        # Send a gentle nudge (some services wait for input)
-        # HTTP requires a request line, others might just send data.
-        if port == 80 or port == 8080:
-            s.send(b'HEAD / HTTP/1.0\r\n\r\n')
-        
-        # Receive up to 1024 bytes
-        banner_data = s.recv(1024).decode().strip()
-        s.close()
-        return banner_data
+        if result == 0:
+            try:
+                # Grab Banner
+                sock.send(b'HEAD / HTTP/1.0\r\n\r\n')
+                banner = sock.recv(1024).decode().strip()
+                return port, True, banner[:50] # Truncated
+            except:
+                return port, True, "No Banner"
+        sock.close()
     except:
-        return None
+        pass
+    return port, False, None
 
 def scan_target(target, ports):
-    """Scans for open ports and grabs banners."""
-    print(f"[*] Starting scan on {target}...")
+    """Threaded Port Scanner"""
+    print(f"[*] Starting Threaded Scan on {target}...")
     start_time = datetime.now()
     
     try:
         target_ip = socket.gethostbyname(target)
-        print(f"[*] IP Address: {target_ip}\n")
+        print(f"[*] IP Address: {target_ip}")
+        print(f"[*] Threads: {MAX_THREADS}\n")
         
-        for port in ports:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex((target_ip, port))
+        # Using ThreadPoolExecutor for concurrency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            # Create a dictionary of future tasks
+            future_to_port = {executor.submit(check_port, target_ip, port): port for port in ports}
             
-            if result == 0:
-                # Port is open!
-                service_info = get_service_banner(target_ip, port)
-                if service_info:
-                    print(f"[+] Port {port}: OPEN -> {service_info[:50]}...") # Truncate long banners
-                else:
-                    print(f"[+] Port {port}: OPEN (No banner)")
-            
-            sock.close()
+            for future in concurrent.futures.as_completed(future_to_port):
+                port, is_open, banner_data = future.result()
+                if is_open:
+                    if banner_data:
+                        print(f"[+] Port {port}: OPEN -> {banner_data}")
+                    else:
+                        print(f"[+] Port {port}: OPEN")
             
     except socket.gaierror:
         print("\n[!] Hostname could not be resolved.")
@@ -71,15 +73,17 @@ def main():
     banner()
     parser = argparse.ArgumentParser(description="A Python-based security toolkit.")
     parser.add_argument("-t", "--target", help="Target IP or Hostname", required=True)
-    parser.add_argument("-p", "--ports", help="Ports to scan (comma separated)", default="21,22,80,443")
+    parser.add_argument("-p", "--ports", help="Ports to scan (comma separated) or range (e.g. 20-100)", default="20-100")
     
     args = parser.parse_args()
     
-    try:
+    # Parse ports (Now supports ranges like "20-100")
+    port_list = []
+    if '-' in args.ports:
+        start, end = map(int, args.ports.split('-'))
+        port_list = range(start, end + 1)
+    else:
         port_list = [int(p) for p in args.ports.split(',')]
-    except ValueError:
-        print("[!] Error: Ports must be integers.")
-        sys.exit(1)
 
     scan_target(args.target, port_list)
 
